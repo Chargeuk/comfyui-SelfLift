@@ -4,7 +4,7 @@
 
 Progressive-resolution sampling for ComfyUI: run the early denoising steps at low resolution, lift the result to full resolution, and finish there — faster generation with no training. Based on the [SelfLift paper](https://arxiv.org/abs/2609.02036) (SelfLift-zero) for rectified-flow image models, plus an experimental MiniMax H3 audio-video adaptation that the paper does not validate. Also included: an experimental H3 port of [TST](https://arxiv.org/abs/2609.08505) temporal-attention correction.
 
-All nodes are in the `selflift` category. The samplers use `sampler`/`sigmas` inputs like `SamplerCustom`; connect the standard `euler` sampler from `KSamplerSelect` and the model's normal scheduler (other samplers are rejected).
+All nodes are in the `selflift` category. The samplers use `sampler`/`sigmas` inputs like `SamplerCustom`; connect standard `euler` from `KSamplerSelect` and the model's normal scheduler. The H3 node also accepts the default `lcm` sampler.
 
 ## SelfLift Progressive Sampler (Image)
 
