@@ -12,6 +12,7 @@ Two front-ends share the same engine:
 - SelfLiftImageSampler: compatible rectified-flow image models.
 """
 
+import copy
 import logging
 import os
 import time
@@ -86,11 +87,17 @@ def _pack(streams, nested):
     return streams[0]
 
 
-def _validate_sampling(model_sampling, sampler):
+def _validate_sampling(model_sampling, sampler, allow_lcm=False):
     if not isinstance(model_sampling, comfy.model_sampling.CONST):
         raise ValueError("SelfLift requires a rectified-flow model")
-    if not isinstance(sampler, comfy.samplers.KSAMPLER) or sampler.sampler_function is not comfy.k_diffusion.sampling.sample_euler:
-        raise ValueError("SelfLift requires the standard Euler sampler")
+    if not isinstance(sampler, comfy.samplers.KSAMPLER):
+        raise ValueError("SelfLift requires the standard Euler sampler" + (" or LCM sampler" if allow_lcm else ""))
+    if allow_lcm and sampler.sampler_function is comfy.k_diffusion.sampling.sample_lcm:
+        if sampler.extra_options or sampler.inpaint_options:
+            raise ValueError("SelfLift LCM requires default sampler options")
+        return True
+    if sampler.sampler_function is not comfy.k_diffusion.sampling.sample_euler:
+        raise ValueError("SelfLift requires the standard Euler sampler" + (" or LCM sampler" if allow_lcm else ""))
     if sampler.extra_options.get("s_churn", 0.0) != 0.0:
         raise ValueError("SelfLift requires Euler with s_churn=0")
 
@@ -228,7 +235,7 @@ def _debug_dump(vae, latents):
 
 def progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                        transition_step, lowres_scale, rho, w_min, w_max, latent_upsample, latent_lifter=None,
-                       highres_tiling=False, model_hires=None):
+                       highres_tiling=False, model_hires=None, allow_lcm=False):
     _validate_schedule(sigmas, transition_step)
     if sigmas.numel() < 2:
         return latent_image
@@ -243,11 +250,15 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
         raise ValueError("SelfLift: noise_mask is not compatible with highres_tiling")
 
     model_sampling = model.get_model_object("model_sampling")
-    _validate_sampling(model_sampling, sampler)
+    is_lcm = _validate_sampling(model_sampling, sampler, allow_lcm)
+    if is_lcm and noise_mask is not None:
+        raise ValueError("SelfLift H3 LCM does not support noise_mask")
 
     streams, nested = _streams(comfy.sample.fix_empty_latent_channels(
         model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
         latent_image.get("downscale_ratio_temporal", None)))
+    if is_lcm and nested and len(streams) < 2:
+        raise ValueError("SelfLift H3 LCM requires at least two nested streams")
     hires_base = model_hires if model_hires is not None else model
     high_model = h3_tiling.tiled_model(hires_base, [tuple(stream.shape) for stream in streams]) if highres_tiling else hires_base
     video = streams[0].ndim == 5
@@ -337,6 +348,43 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     transition = {}
     low_evaluations = 0
 
+    if is_lcm:
+        # ComfyUI normally creates one generator per sampler invocation. Keep one
+        # across both stages so the lift does not restart the LCM noise sequence.
+        original_lcm = sampler.sampler_function
+        sampler = copy.copy(sampler)
+        lcm_random = {"generator": None, "boundary": None, "boundary_drawn": False}
+        low_elements = b * c * (t if video else 1) * h * w
+        high_elements = b * c * (t if video else 1) * H * W
+
+        def lcm_with_shared_noise(model_fn, x, schedule, **kwargs):
+            if lcm_random["generator"] is None:
+                generator = torch.Generator(device=x.device)
+                generator.manual_seed((seed + (1 if x.device.type == "cpu" else 0)) % (1 << 64))
+                lcm_random["generator"] = generator
+            generator = lcm_random["generator"]
+
+            def noise_sampler(sigma, sigma_next):
+                boundary = low_evaluations == transition_step and not lcm_random["boundary_drawn"]
+                shape = list(x.shape)
+                if boundary:
+                    if nested:
+                        shape[-1] += (high_elements - low_elements) // b
+                    else:
+                        shape[-2:] = [H, W]
+                noise = torch.randn(shape, dtype=x.dtype, layout=x.layout, device=x.device, generator=generator)
+                if boundary:
+                    lcm_random["boundary"] = noise
+                    lcm_random["boundary_drawn"] = True
+                    # Native LCM consumes this result, but the low-stage output is
+                    # discarded: the full-size draw is applied to the lifted x0.
+                    return torch.zeros_like(x)
+                return noise
+
+            return original_lcm(model_fn, x, schedule, noise_sampler=noise_sampler, **kwargs)
+
+        sampler.sampler_function = lcm_with_shared_noise
+
     def callback_low(step, x0, x, total):
         nonlocal low_evaluations
         step = low_evaluations
@@ -384,9 +432,12 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     x0_streams, _ = _streams(transition.pop("x0"))
     sigma_k = sigmas[transition_step - 1]
     sigma_next = sigmas[transition_step]
-    auxiliary_next = [_euler_step(state.to(device), denoised.to(device), sigma_k, sigma_next)
-                      for state, denoised in zip(low_streams[1:], x0_streams[1:])]
+    auxiliary_next = (None if is_lcm else
+                      [_euler_step(state.to(device), denoised.to(device), sigma_k, sigma_next)
+                       for state, denoised in zip(low_streams[1:], x0_streams[1:])])
+    auxiliary_x0 = [s.to(device) for s in x0_streams[1:]] if is_lcm else None
     latent_format = model.get_model_object("latent_format")
+    bypass_x0 = x0_streams[0].to(device) if is_lcm and (h, w) == (H, W) else None
     z0_low_vae = latent_format.process_out(x0_streams[0].float()).to(device)
     del low_latent, noise_low, low_streams, x0_streams, positive_low, negative_low
     transition_timer.mark("prepare_endpoint")
@@ -395,14 +446,20 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     # Artifact-Aware Consistency Lift (Eqs. 4-9); skip branches the weights discard
     need_pix = rho > 0.0 and w_max > 0.0
     need_lat = not (rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0)
-    z_lat_vae, z_pix_vae = selflift.paired_lifts(
-        z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
-        need_lat=need_lat, need_pix=need_pix)
+    if is_lcm and (h, w) == (H, W):
+        # A no-resolution-change run must reproduce native LCM exactly.
+        z_lat_vae, z_pix_vae = z0_low_vae, None
+        need_pix = False
+    else:
+        z_lat_vae, z_pix_vae = selflift.paired_lifts(
+            z0_low_vae, vae, (H, W), latent_upsample, latent_lifter,
+            need_lat=need_lat, need_pix=need_pix)
     transition_timer.mark("paired_lifts")
     log_memory("transition lifts_ready", model.load_device)
     z_lat = latent_format.process_in(z_lat_vae) if z_lat_vae is not None else None
     z_pix = latent_format.process_in(z_pix_vae) if z_pix_vae is not None else None
-    z0_high = selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=m_full)
+    z0_high = (bypass_x0 if bypass_x0 is not None else
+               selflift.artifact_aware_consistency_lift(z_lat, z_pix, rho, w_min, w_max, mask=m_full))
     if m_full is not None:
         # restore the keep-region with the true original instead of any lifted estimate
         m_cast = m_full.to(device=z0_high.device, dtype=z0_high.dtype)
@@ -419,13 +476,24 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     transition_timer.mark("correction_and_debug")
     log_memory("transition correction_ready", model.load_device)
 
-    # Re-noise the corrected video/image endpoint at the sigma of the reused model
-    # evaluation, then complete that Euler interval without another denoiser call.
-    video_noise = comfy.sample.prepare_noise(z0_high, (seed + 1) % (1 << 64),
-                                             latent_image.get("batch_index", None)).to(z0_high)
-    video_state = model_sampling.noise_scaling(sigma_k, video_noise, z0_high)
-    next_streams = [_euler_step(video_state, z0_high, sigma_k, sigma_next)] + auxiliary_next
-    del z0_high, video_noise, video_state, auxiliary_next
+    # Reuse the last prediction without another denoiser call. Euler completes its
+    # interval; LCM re-noises every stream directly at the next sigma.
+    if is_lcm:
+        boundary_noise = lcm_random.pop("boundary")
+        if boundary_noise is None:
+            raise RuntimeError("SelfLift LCM: transition noise was not generated")
+        shapes = [z0_high.shape] + [s.shape for s in auxiliary_x0]
+        noise_streams = (comfy.utils.unpack_latents(boundary_noise, shapes)
+                         if nested else [boundary_noise])
+        next_streams = [model_sampling.noise_scaling(sigma_next, noise.to(x0), x0)
+                        for noise, x0 in zip(noise_streams, [z0_high] + auxiliary_x0)]
+        del boundary_noise, noise_streams, auxiliary_x0, z0_high
+    else:
+        video_noise = comfy.sample.prepare_noise(z0_high, (seed + 1) % (1 << 64),
+                                                 latent_image.get("batch_index", None)).to(z0_high)
+        video_state = model_sampling.noise_scaling(sigma_k, video_noise, z0_high)
+        next_streams = [_euler_step(video_state, z0_high, sigma_k, sigma_next)] + auxiliary_next
+        del z0_high, video_noise, video_state, auxiliary_next
     resume_streams = [model_sampling.inverse_noise_scaling(sigma_next, s) for s in next_streams]
     resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
     resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
@@ -474,7 +542,7 @@ class SelfLiftH3Sampler:
             "negative": ("CONDITIONING",),
             "vae": ("VAE", {"tooltip": "Video VAE used for the pixel re-encode anchor at the resolution transition."}),
             "latent_image": ("LATENT", {"tooltip": "Target-resolution H3 AV latent defining size and duration. Existing latent content and noise masks are accepted."}),
-            "sampler": ("SAMPLER", {"tooltip": "Standard Euler only; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
+            "sampler": ("SAMPLER", {"tooltip": "Standard Euler or default LCM; SelfLift reuses its transition-step prediction to keep the original NFE count."}),
             "sigmas": ("SIGMAS",),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             "cfg": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
@@ -509,7 +577,8 @@ class SelfLiftH3Sampler:
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
         return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                                    transition_step, lowres_scale, rho, w_min, w_max, "nearest",
-                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires),)
+                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires,
+                                   allow_lcm=True),)
 
 
 class SelfLiftImageSampler:

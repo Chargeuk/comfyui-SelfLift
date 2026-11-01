@@ -76,8 +76,9 @@ A controlled single-seed H3 run found: clean native baseline and clean pure pixe
 
 ## Notes and limitations
 
-- Only standard Euler with `s_churn=0`.
-- `noise_mask` is supported on both samplers with Set Latent Noise Mask semantics (1 = generate, 0 = keep the original content; use an initialized latent to have content worth keeping). Masks at any resolution are resized to the latent grid, and a time length of 1 is shared over all frames. The keep-region is pinned to the original latent at every step, and the artifact-aware correction is restricted to the generate region. `noise_mask` is not compatible with `highres_tiling`.
+- The H3 node accepts standard Euler (`s_churn=0`) or the default ComfyUI LCM sampler. The image node remains Euler-only. For a six-step H3 LCM schedule, provide seven sigma knots and choose a `transition_step` from 1 to 5 (for example, 3). Select the learned H3 upscaler and set `rho=0` for the direct learned lift. The LCM transition lifts the clean video prediction and applies the next sigma using the same random stream for both video and audio; it does not add a denoiser evaluation. LCM options other than the defaults are rejected.
+- H3 LCM does not support `noise_mask`; use Euler for masked sampling. A scale of 1 bypasses the LCM lift, permitting comparison with native LCM. Real-model quality and performance have not been validated for this extension.
+- With Euler, `noise_mask` is supported on both sampler nodes with Set Latent Noise Mask semantics (1 = generate, 0 = keep the original content; use an initialized latent to have content worth keeping). Masks at any resolution are resized to the latent grid, and a time length of 1 is shared over all frames. The keep-region is pinned to the original latent at every step, and the artifact-aware correction is restricted to the generate region. `noise_mask` is not compatible with `highres_tiling`.
 - Use the VAE belonging to the sampled model so the pixel anchor stays in the same latent space.
 - H3's 768-pixel short edge becomes 384 px at `lowres_scale=0.5`, which may sit outside the backbone's training distribution — validate per model.
 - SelfLift-rich (the distilled lifter + On-Policy Self Recovery) requires training and is not included.
