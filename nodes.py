@@ -556,15 +556,41 @@ class SelfLiftH3Sampler:
             "model_hires": ("MODEL", {"tooltip": "Optional: model used for the high-resolution stage instead of `model` (e.g. a different checkpoint or LoRA stack). Must share the same architecture and latent format. The low-resolution prefix always runs on `model`."}),
             "highres_tiling": ("BOOLEAN", {"default": False, "label_on": "高分辨率分块：开启", "label_off": "高分辨率分块：关闭", "tooltip": "Experimental: select 1–8 spatial tiles from available memory at high-resolution preparation. Audio input and references remain complete; only the first tile's audio prediction is retained. Quality and speed may change."}),
             "upscaler_unload": ("BOOLEAN", {"default": True, "label_on": "放大后卸载：开启", "label_off": "放大后卸载：关闭", "tooltip": "Unload the external H3 upscaler from VRAM right after the lift, before the high-resolution stage loads. Disable only if the upscaler is reused between runs and VRAM is not tight."}),
+            "mmh3_enabled": ("BOOLEAN", {"default": False, "tooltip": "Run MMH3 Ultimate Upscale after SelfLift. Requires MMH3 and its noise, sampler and sigmas inputs."}),
+            "mmh3_noise": ("NOISE",),
+            "mmh3_sampler": ("SAMPLER",),
+            "mmh3_sigmas": ("SIGMAS",),
+            "mmh3_positive": ("CONDITIONING",),
+            "mmh3_negative": ("CONDITIONING",),
+            "mmh3_cfg": ("FLOAT", {"forceInput": True}),
+            "latent_upscale_param": ("H3_UPSCALE_PARAM",),
+            "temporal_split_param": ("H3_TEMPORAL_PARAM",),
+            "spatial_split_param": ("H3_SPATIAL_PARAM",),
         }}
 
-    RETURN_TYPES = ("LATENT",)
+    RETURN_TYPES = ("LATENT", "LATENT")
+    RETURN_NAMES = ("latent", "final_latent")
     FUNCTION = "sample"
     CATEGORY = "selflift"
 
     def sample(self, model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
                transition_step, lowres_scale, rho, w_min, w_max, upscaler_model, model_hires=None, highres_tiling=False,
-               upscaler_unload=True):
+               upscaler_unload=True, mmh3_enabled=False, mmh3_noise=None, mmh3_sampler=None, mmh3_sigmas=None,
+               mmh3_positive=None, mmh3_negative=None, mmh3_cfg=None, latent_upscale_param=None,
+               temporal_split_param=None, spatial_split_param=None):
+        mmh3 = None
+        if mmh3_enabled:
+            missing = [name for name, value in (("mmh3_noise", mmh3_noise), ("mmh3_sampler", mmh3_sampler),
+                                                ("mmh3_sigmas", mmh3_sigmas)) if value is None]
+            if missing:
+                raise ValueError("SelfLift H3: enable MMH3 only after connecting " + ", ".join(missing))
+            # Resolve the registered node at execution time: custom-node package IDs
+            # depend on ComfyUI's loader, and MMH3 is optional when disabled.
+            import inspect
+            import nodes as comfy_nodes
+            mmh3 = comfy_nodes.NODE_CLASS_MAPPINGS.get("MMH3UltimateUpscale")
+            if mmh3 is None or "offload_diffusion" not in inspect.signature(mmh3.execute).parameters:
+                raise RuntimeError("SelfLift H3: install or update the Chargeuk MMH3 Ultimate Upscale fork to use the integrated stage, then restart ComfyUI")
         if rho == 0.0 and upscaler_model == "none":
             raise ValueError(
                 "SelfLift H3: rho=0 with upscaler_model=none disables both SelfLift-zero correction "
@@ -575,10 +601,22 @@ class SelfLiftH3Sampler:
             if rho > 0.0 and w_max > 0.0:
                 logging.warning("SelfLift H3: rho > 0 with an external upscaler is a hybrid experiment; select upscaler_model=none to test the paper's SelfLift-zero direct route")
             lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
-        return (progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
-                                   transition_step, lowres_scale, rho, w_min, w_max, "nearest",
-                                   latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires,
-                                   allow_lcm=True),)
+        original = progressive_sample(model, positive, negative, vae, latent_image, sampler, sigmas, seed, cfg,
+                                      transition_step, lowres_scale, rho, w_min, w_max, "nearest",
+                                      latent_lifter=lifter, highres_tiling=highres_tiling, model_hires=model_hires,
+                                      allow_lcm=True)
+        if mmh3 is None:
+            return original, original
+        # Pass the real high-resolution patcher, retaining its LoRAs and hooks;
+        # MMH3 keeps the diffusion model loaded unless Comfy needs the memory.
+        final = mmh3.execute(latent=original, conditioning=positive if mmh3_positive is None else mmh3_positive,
+                             model=model_hires if model_hires is not None else model,
+                             noise=mmh3_noise, sampler=mmh3_sampler, sigmas=mmh3_sigmas,
+                             negative=negative if mmh3_negative is None else mmh3_negative,
+                             cfg=cfg if mmh3_cfg is None else mmh3_cfg,
+                             latent_upscale_param=latent_upscale_param, temporal_split_param=temporal_split_param,
+                             spatial_split_param=spatial_split_param, offload_diffusion=False)[0]
+        return original, final
 
 
 class SelfLiftImageSampler:
