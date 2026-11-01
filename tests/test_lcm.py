@@ -112,4 +112,39 @@ class LCMTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'noise_mask'):
             nodes.progressive_sample(model, [], [], None, latent, comfy.samplers.KSAMPLER(sampling.sample_lcm), torch.tensor([.9, .5, 0.]), 1, 1, 1, .5, 0, 0, 0, 'nearest', allow_lcm=True)
 
+class MMH3IntegrationTests(unittest.TestCase):
+    def test_disabled_returns_original_without_resolving_mmh3(self):
+        original = {'samples': object()}
+        with patch.object(nodes, 'progressive_sample', return_value=original):
+            out = nodes.SelfLiftH3Sampler().sample(
+                object(), [], [], None, original, object(), object(), 42, 3.0,
+                1, .5, .5, .5, 1.0, 'none')
+        self.assertIs(out[0], original)
+        self.assertIs(out[1], original)
+
+    def test_enabled_forwards_patcher_sampling_and_options(self):
+        original, final = {'samples': object()}, {'samples': object()}
+        base, hires, pos, neg = object(), object(), object(), object()
+        noise, sampler, sigmas = object(), object(), object()
+        upscale, temporal, spatial = object(), object(), object()
+        calls = []
+        class MMH3:
+            @classmethod
+            def execute(cls, offload_diffusion=True, **kwargs):
+                calls.append(dict(kwargs, offload_diffusion=offload_diffusion))
+                return (final, {}, {})
+        import nodes as comfy_nodes
+        with patch.dict(comfy_nodes.NODE_CLASS_MAPPINGS, {'MMH3UltimateUpscale': MMH3}), \
+             patch.object(nodes, 'progressive_sample', return_value=original):
+            out = nodes.SelfLiftH3Sampler().sample(
+                base, pos, neg, None, original, object(), object(), 42, 3.0,
+                1, .5, .5, .5, 1.0, 'none', model_hires=hires, mmh3_enabled=True,
+                mmh3_noise=noise, mmh3_sampler=sampler, mmh3_sigmas=sigmas,
+                latent_upscale_param=upscale, temporal_split_param=temporal, spatial_split_param=spatial)
+        self.assertEqual(out, (original, final))
+        self.assertEqual(calls, [dict(latent=original, conditioning=pos, model=hires,
+            noise=noise, sampler=sampler, sigmas=sigmas, negative=neg, cfg=3.0,
+            latent_upscale_param=upscale, temporal_split_param=temporal,
+            spatial_split_param=spatial, offload_diffusion=False)])
+
 if __name__ == '__main__': unittest.main()

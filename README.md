@@ -30,6 +30,12 @@ Experimental H3 audio-video adaptation (not paper-validated). Two modes:
 
 Extra inputs: `upscaler_model`, `upscaler_unload` (default on: unloads the upscaler from VRAM right after the lift, before the high-resolution stage) and `highres_tiling` (experimental: splits the high-res phase into 1–8 spatial tiles to save VRAM; only the first tile's audio is kept, there is no cross-tile attention, ControlNet is unsupported, and quality/speed may change).
 
+### Optional MMH3 stage
+
+Install the Chargeuk [MMH3 Ultimate Upscale fork](https://github.com/Chargeuk/Comfyui-MMH3-UltimateUpscale) and restart ComfyUI. Enable `mmh3_enabled` and connect `mmh3_noise`, `mmh3_sampler`, and `mmh3_sigmas`. Optionally connect the MMH3 latent upscale, temporal split, and spatial split parameter nodes. Unconnected parameters skip their respective MMH3 stages. `mmh3_positive`, `mmh3_negative`, and `mmh3_cfg` override the corresponding SelfLift inputs; unconnected inputs inherit them.
+
+The first output is the original SelfLift latent; `final_latent` is the MMH3 result, or the same original latent when disabled. MMH3 uses `model_hires` if connected, otherwise `model`. The integrated stage avoids explicitly offloading that diffusion model, although ComfyUI can still move it when memory is needed. The standalone MMH3 node retains its usual offload behavior.
+
 ### Optional H3 upscaler
 
 Download from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into `ComfyUI/models/latent_upscale_models/` and restart. The node selects the first filename containing `h3`, otherwise `none` (nearest-neighbor lift).
