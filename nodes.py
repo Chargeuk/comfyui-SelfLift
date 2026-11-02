@@ -33,7 +33,7 @@ from . import selflift
 from . import h3_upscaler
 from . import h3_tiling
 from . import h3_tst
-from .diagnostics import log_memory
+from .diagnostics import diagnostic_scope, log_memory
 
 
 class _StageTimer:
@@ -419,10 +419,11 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
                         if video else getattr(model.get_model_object("latent_format"), "spacial_downscale_ratio", 1))
     low_timer = _StageTimer("low_resolution", low_model.load_device, (h, w), resolution_scale)
     log_memory("low_resolution start", low_model.load_device)
-    comfy.samplers.sample(low_model, noise_low, positive_low, negative_low, cfg, low_model.load_device,
-                          sampler, sigmas[:transition_step + 1], low_model.model_options,
-                          latent_image=low_latent, callback=callback_low,
-                          disable_pbar=disable_pbar, seed=seed)
+    with diagnostic_scope("low_resolution", low_model):
+        comfy.samplers.sample(low_model, noise_low, positive_low, negative_low, cfg, low_model.load_device,
+                              sampler, sigmas[:transition_step + 1], low_model.model_options,
+                              latent_image=low_latent, callback=callback_low,
+                              disable_pbar=disable_pbar, seed=seed)
     if low_evaluations != transition_step:
         raise RuntimeError(f"SelfLift: expected {transition_step} low-resolution callbacks, received {low_evaluations}; check sampler wrappers")
     low_timer.finish()
@@ -517,10 +518,11 @@ def progressive_sample(model, positive, negative, vae, latent_image, sampler, si
     high_timer = _StageTimer("high_resolution", model.load_device, (H, W), resolution_scale)
     if highres_tiling:
         logging.info("[SelfLift plan] automatic high-resolution tiling enabled; preparation selects the tile count")
-    out = comfy.samplers.sample(high_model, resume_noise, positive, negative, cfg, model.load_device,
-                                sampler, sigmas[transition_step:], high_model.model_options,
-                                latent_image=resume_latent, callback=callback_high,
-                                disable_pbar=disable_pbar, seed=seed)
+    with diagnostic_scope("high_resolution", high_model):
+        out = comfy.samplers.sample(high_model, resume_noise, positive, negative, cfg, model.load_device,
+                                    sampler, sigmas[transition_step:], high_model.model_options,
+                                    latent_image=resume_latent, callback=callback_high,
+                                    disable_pbar=disable_pbar, seed=seed)
     del resume_latent, resume_noise
     if high_evaluations != total_steps - transition_step:
         raise RuntimeError(f"SelfLift: expected {total_steps - transition_step} high-resolution callbacks, received {high_evaluations}; check sampler wrappers")
@@ -609,13 +611,14 @@ class SelfLiftH3Sampler:
             return original, original
         # Pass the real high-resolution patcher, retaining its LoRAs and hooks;
         # MMH3 keeps the diffusion model loaded unless Comfy needs the memory.
-        final = mmh3.execute(latent=original, conditioning=positive if mmh3_positive is None else mmh3_positive,
-                             model=model_hires if model_hires is not None else model,
-                             noise=mmh3_noise, sampler=mmh3_sampler, sigmas=mmh3_sigmas,
-                             negative=negative if mmh3_negative is None else mmh3_negative,
-                             cfg=cfg if mmh3_cfg is None else mmh3_cfg,
-                             latent_upscale_param=latent_upscale_param, temporal_split_param=temporal_split_param,
-                             spatial_split_param=spatial_split_param, offload_diffusion=False)[0]
+        with diagnostic_scope("mmh3", model_hires if model_hires is not None else model):
+            final = mmh3.execute(latent=original, conditioning=positive if mmh3_positive is None else mmh3_positive,
+                                 model=model_hires if model_hires is not None else model,
+                                 noise=mmh3_noise, sampler=mmh3_sampler, sigmas=mmh3_sigmas,
+                                 negative=negative if mmh3_negative is None else mmh3_negative,
+                                 cfg=cfg if mmh3_cfg is None else mmh3_cfg,
+                                 latent_upscale_param=latent_upscale_param, temporal_split_param=temporal_split_param,
+                                 spatial_split_param=spatial_split_param, offload_diffusion=False)[0]
         return original, final
 
 

@@ -2,6 +2,7 @@
 import importlib.util
 import os
 import sys
+import threading
 import types
 import unittest
 from unittest.mock import patch
@@ -22,7 +23,7 @@ spec = importlib.util.spec_from_file_location('selflift_test', os.path.join(root
 package = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = package
 spec.loader.exec_module(package)
-from selflift_test import nodes
+from selflift_test import nodes, diagnostics
 sys.argv.remove('--cpu')
 
 class Identity:
@@ -146,5 +147,106 @@ class MMH3IntegrationTests(unittest.TestCase):
             noise=noise, sampler=sampler, sigmas=sigmas, negative=neg, cfg=3.0,
             latent_upscale_param=upscale, temporal_split_param=temporal,
             spatial_split_param=spatial, offload_diffusion=False)])
+
+class DiagnosticTests(unittest.TestCase):
+    def model(self):
+        return types.SimpleNamespace(wrappers={}, model_options={}, model=object(),
+                                     patches={}, patches_uuid='same-weights', load_device=torch.device('cpu'))
+
+    def test_native_wrappers_preserve_identity_outputs_and_callback(self):
+        model = self.model()
+        original_wrappers, original_options, base = model.wrappers, model.model_options, model.model
+        callback_calls = []
+        owner = types.SimpleNamespace(model_patcher=model)
+        extension = nodes.comfy.patcher_extension
+        def invoke(kind, fn, *args):
+            wrappers = [wrapper for group in model.wrappers[kind].values() for wrapper in group]
+            return extension.WrapperExecutor.new_class_executor(fn, owner, wrappers).execute(*args)
+        def predict(x):
+            return x + 2
+        def prepare(patcher):
+            self.assertIs(patcher, model)
+            return patcher.model
+        def sample(guider, sigmas, options, callback, noise):
+            result = invoke('predict_noise', predict, noise)
+            self.assertEqual(callback(0, result, noise, 1), 'callback-result')
+            return result
+        def outer():
+            self.assertIs(invoke('prepare_sampling', prepare, model), base)
+            return invoke('sampler_sample', sample, owner, object(), {}, callback, 3)
+        def callback(*args):
+            callback_calls.append(args)
+            return 'callback-result'
+        with patch.dict(os.environ, {'SELFLIFT_DIAGNOSTICS': '1'}), patch.object(diagnostics.logging, 'info') as log:
+            with diagnostics.diagnostic_scope('test', model):
+                self.assertEqual(invoke('outer_sample', outer), 5)
+            self.assertTrue(any('compile_s=unknown' in str(call) for call in log.call_args_list))
+        self.assertEqual(callback_calls, [(0, 5, 3, 1)])
+        self.assertIs(model.wrappers, original_wrappers)
+        self.assertIs(model.model_options, original_options)
+        self.assertIs(model.model, base)
+        self.assertEqual(model.patches_uuid, 'same-weights')
+        self.assertIsNone(diagnostics._active_stage.get())
+        self.assertIsNone(diagnostics._active_sample.get())
+
+    def test_error_restores_scope_and_does_not_sync_cuda(self):
+        model = self.model()
+        original = model.wrappers
+        with patch.dict(os.environ, {'SELFLIFT_DIAGNOSTICS': '1'}), \
+             patch.object(diagnostics.torch.cuda, 'synchronize') as synchronize, \
+             patch.object(diagnostics.psutil, 'Process', side_effect=OSError('probe unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'sampling failed'):
+                with diagnostics.diagnostic_scope('test', model):
+                    def failed_sample():
+                        raise RuntimeError('sampling failed')
+                    executor = nodes.comfy.patcher_extension.WrapperExecutor.new_class_executor(
+                        failed_sample, types.SimpleNamespace(model_patcher=model), [diagnostics._outer_sample])
+                    executor.execute()
+        self.assertIs(model.wrappers, original)
+        self.assertIsNone(diagnostics._active_stage.get())
+        self.assertIsNone(diagnostics._active_sample.get())
+        self.assertFalse(diagnostics._scopes)
+        synchronize.assert_not_called()
+
+    def test_overlapping_threads_restore_only_after_last_scope(self):
+        model = self.model()
+        original = model.wrappers
+        entered, release = threading.Event(), threading.Event()
+        failures = []
+        def worker():
+            try:
+                with diagnostics.diagnostic_scope('worker', model):
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError('scope release timed out')
+            except BaseException as error:
+                failures.append(error)
+        with patch.dict(os.environ, {'SELFLIFT_DIAGNOSTICS': '1'}):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                installed = model.wrappers
+                # A reader in an unrelated context sees wrappers that delegate unchanged.
+                self.assertEqual(diagnostics._predict_noise(lambda value: value + 1, 3), 4)
+                with diagnostics.diagnostic_scope('main', model):
+                    self.assertIs(model.wrappers, installed)
+                self.assertIs(model.wrappers, installed)
+            finally:
+                release.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(failures)
+        self.assertIs(model.wrappers, original)
+        self.assertFalse(diagnostics._scopes)
+
+    def test_disabled_does_not_install_wrappers(self):
+        model = self.model()
+        original = model.wrappers
+        with patch.dict(os.environ, {'SELFLIFT_DIAGNOSTICS': '0'}), patch.object(diagnostics.logging, 'info') as log:
+            with diagnostics.diagnostic_scope('disabled', model) as stage:
+                stage.event('unused')
+                self.assertIs(model.wrappers, original)
+            log.assert_not_called()
 
 if __name__ == '__main__': unittest.main()

@@ -21,7 +21,7 @@ import folder_paths
 
 from comfy.ldm.minimax.vae import LATENTS_MEAN, LATENTS_STD
 
-from .diagnostics import log_memory
+from .diagnostics import diagnostic_scope, log_memory
 
 _FOLDER = "latent_upscale_models"
 
@@ -359,42 +359,51 @@ def learned_latent_lift(z0_low, out_hw, model_name, device=None, force_unload=Fa
     h, w = z0_low.shape[-2], z0_low.shape[-1]
     scale = (H / h + W / w) / 2.0
 
-    log_memory("upscaler before_load", device)
-    patcher = _load_model(model_name, device)
-    model = patcher.model
-    memory_required = _inference_memory_required(model, z0_low, (H, W))
-    length = z0_low.shape[2]
-    chunk, overlap = model.temporal_chunk_settings()
-    identity = (H, W) == (h, w)
-    chunked = not identity and length > chunk
-    windows = list(_temporal_windows(length, chunk, overlap)) if chunked else []
-    actual_window = max(end - start + 2 * overlap for _, _, start, end in windows) if chunked else length
-    budget_window = model.temporal_window_budget(length)
-    logging.info("[SelfLift upscaler] model=%s dtype=%s input=%s target_hw=%s "
-                 "spatial_lift=(%.4f, %.4f) scale_embedding=%.4f mode=%s "
-                 "chunk=%d overlap=%d windows=%d max_input_window=%d budget_window=%d "
-                 "estimated_workspace=%.2f MiB",
-                 model_name, model.conv_in.weight.dtype, tuple(z0_low.shape), (H, W),
-                 H / h, W / w, scale - 1.0, "identity" if identity else "chunked" if chunked else "full",
-                 chunk, overlap if chunked else 0, len(windows) if chunked else int(not identity),
-                 actual_window if not identity else 0, budget_window, memory_required / 2**20)
-    try:
-        comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
-        log_memory("upscaler after_load", device)
-        dtype = model.conv_in.weight.dtype
-        mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
-        std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+    with diagnostic_scope("latent_upscaler", device=device) as diagnostic:
+        log_memory("upscaler before_load", device)
+        patcher = _load_model(model_name, device)
+        diagnostic.model = patcher
+        diagnostic.event("checkpoint_ready")
+        model = patcher.model
+        memory_required = _inference_memory_required(model, z0_low, (H, W))
+        length = z0_low.shape[2]
+        chunk, overlap = model.temporal_chunk_settings()
+        identity = (H, W) == (h, w)
+        chunked = not identity and length > chunk
+        windows = list(_temporal_windows(length, chunk, overlap)) if chunked else []
+        actual_window = max(end - start + 2 * overlap for _, _, start, end in windows) if chunked else length
+        budget_window = model.temporal_window_budget(length)
+        logging.info("[SelfLift upscaler] model=%s dtype=%s input=%s target_hw=%s "
+                     "spatial_lift=(%.4f, %.4f) scale_embedding=%.4f mode=%s "
+                     "chunk=%d overlap=%d windows=%d max_input_window=%d budget_window=%d "
+                     "estimated_workspace=%.2f MiB",
+                     model_name, model.conv_in.weight.dtype, tuple(z0_low.shape), (H, W),
+                     H / h, W / w, scale - 1.0, "identity" if identity else "chunked" if chunked else "full",
+                     chunk, overlap if chunked else 0, len(windows) if chunked else int(not identity),
+                     actual_window if not identity else 0, budget_window, memory_required / 2**20)
+        try:
+            diagnostic.event("load_models_gpu_start")
+            comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
+            diagnostic.event("load_models_gpu_end")
+            log_memory("upscaler after_load", device)
+            dtype = model.conv_in.weight.dtype
+            mean = torch.tensor(LATENTS_MEAN, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
+            std = torch.tensor(LATENTS_STD, dtype=dtype, device=device).view(1, -1, 1, 1, 1)
 
-        x = z0_low.to(device=device, dtype=dtype)
-        with torch.no_grad():
-            x = (x - mean) / std
-            out = model(x, scale=scale, target_size=(z0_low.shape[2], H, W))
-            out = (out * std + mean).float().to(comfy.model_management.intermediate_device())
-        log_memory("upscaler end", device)
-        return out
-    finally:
-        if force_unload:
-            # The high-resolution stage runs right after the lift and never needs the upscaler again.
-            comfy.model_management.unload_model_and_clones(patcher, unload_additional_models=False)
-            comfy.model_management.soft_empty_cache()
-            log_memory("upscaler after_unload", device)
+            x = z0_low.to(device=device, dtype=dtype)
+            with torch.no_grad():
+                x = (x - mean) / std
+                diagnostic.event("forward_start")
+                out = model(x, scale=scale, target_size=(z0_low.shape[2], H, W))
+                diagnostic.event("forward_end")
+                out = (out * std + mean).float().to(comfy.model_management.intermediate_device())
+            diagnostic.event("output_ready")
+            log_memory("upscaler end", device)
+            return out
+        finally:
+            if force_unload:
+                # The high-resolution stage runs right after the lift and never needs the upscaler again.
+                comfy.model_management.unload_model_and_clones(patcher, unload_additional_models=False)
+                comfy.model_management.soft_empty_cache()
+                diagnostic.event("unload_end")
+                log_memory("upscaler after_unload", device)
